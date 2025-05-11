@@ -1,171 +1,279 @@
 import os
-import dash
-from dash import dcc, html, dash_table
-from dash.dependencies import Input, Output, State
-import plotly.graph_objs as go
+import re
+import ast
 import networkx as nx
-import numpy as np
+import dash
+import dash.html as html
+import dash.dcc as dcc
+import plotly.graph_objs as go
+import pandas as pd
+from dash.dependencies import Input, Output, State
+import warnings
+warnings.simplefilter("error", SyntaxWarning)
 
-# 1. Extract project file modules
+# Step 1: Gather file dependencies
 def gather_dependencies(project_root):
     dependencies = {}
-    project_modules = set()
+    module_map = {}
 
-    # First pass: collect all module names
-    for root, _, files in os.walk(project_root):
-        for file in files:
-            if file.endswith('.py'):
-                rel_path = os.path.relpath(os.path.join(root, file), project_root)
-                module_name = rel_path.replace(os.sep, '.').replace('.py', '')
-                project_modules.add(module_name)
-
-    # Second pass: extract in-project imports
-    for root, _, files in os.walk(project_root):
+    # Walk through the directory and find Python files
+    for root, dirs, files in os.walk(project_root):
         for file in files:
             if file.endswith('.py'):
                 file_path = os.path.join(root, file)
-                rel_path = os.path.relpath(file_path, project_root)
-                current_module = rel_path.replace(os.sep, '.').replace('.py', '')
 
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    lines = f.readlines()
+                # Get the relative path of the file
+                relative_path = os.path.relpath(file_path, project_root)
 
-                imports = []
-                for line in lines:
-                    line = line.strip()
-                    if line.startswith('import '):
-                        parts = line.split()
-                        if len(parts) >= 2:
-                            imports.append(parts[1].split('.')[0])
-                    elif line.startswith('from '):
-                        parts = line.split()
-                        if len(parts) >= 2:
-                            imports.append(parts[1].split('.')[0])
+                # Split the relative path to get the directory and file
+                parts = relative_path.split(os.sep)
 
-                # Only keep in-project module dependencies
-                filtered_imports = [imp for imp in imports if imp in project_modules]
-                dependencies[rel_path] = {
-                    "imports": filtered_imports,
-                    "path": file_path
-                }
+                # If the length of parts is greater than 1, this means it's inside a subfolder
+                if len(parts) > 1:
+                    # The immediate parent folder is the module name
+                    module_name = parts[0]  # This will give you the folder name as the module
+                else:
+                    # If it's a root file, classify it as 'root'
+                    module_name = "root"
 
-    return dependencies
+                # Store the file path with its corresponding module name
+                module_map[file_path] = module_name
 
-# 2. Create graph and compute metrics
+    # Read through each Python file and extract import statements
+    for file_path, module_name in module_map.items():
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+
+        imports = set()
+
+        try:
+            import_statements = re.findall(
+                r"^\s*(?:import|from)\s+([a-zA-Z0-9_\.]+)",
+                content,
+                re.MULTILINE
+            )
+        except re.error as e:
+            print(f"Regex error in file {file_path}: {e}")
+            import_statements = []
+
+        # Map the found imports to the files in the module_map
+        for imp in import_statements:
+            for mod_name, mod_path in module_map.items():
+                # If the import statement matches any known module path, add the file to dependencies
+                if imp == mod_name or imp.startswith(mod_name + "."):
+                    imports.add(mod_path)
+                    break
+
+        dependencies[file_path] = list(imports)
+
+    return dependencies, module_map
+
+# Step 2: Create graph
 def create_dependency_graph(dependencies):
     G = nx.DiGraph()
-    metrics = {}
 
-    for file, data in dependencies.items():
-        G.add_node(file)
-        loc = count_loc(data['path'])
-        num_imports = len(data['imports'])
-        metrics[file] = {
-            "LOC": loc,
-            "NumImports": num_imports,
-            "DependsOnMe": 0  # will be filled later
-        }
-        for dep in data['imports']:
-            if dep in dependencies:
-                G.add_edge(file, dep)
+    # Add nodes and dependencies as edges in the graph
+    for file, deps in dependencies.items():
+        G.add_node(file, loc=count_loc(file))
+        for dep in deps:
+            G.add_edge(file, dep)
 
-    # Update reverse dependencies count
-    for target in G.nodes():
-        metrics[target]["DependsOnMe"] = len(list(G.predecessors(target)))
+    return G
 
-    return G, metrics
-
-def count_loc(filepath):
+# Count lines of code (LOC)
+def count_loc(file_path):
     try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            return len(f.readlines())
-    except Exception:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            return sum(1 for line in f if line.strip() and not line.strip().startswith('#'))
+    except Exception as e:
+        print(f"Error reading {file_path}: {e}")
         return 0
 
-# 3. Plot with plotly
-def generate_figure(G, metrics):
+def generate_dependency_figure(G, module_map):
     pos = nx.spring_layout(G, seed=42)
-    nodes = list(G.nodes())
-    edges = list(G.edges())
 
-    node_x = [pos[node][0] for node in nodes]
-    node_y = [pos[node][1] for node in nodes]
-    node_color = [metrics[node]['LOC'] for node in nodes]
-    node_size = [10 + metrics[node]['NumImports'] * 4 for node in nodes]
-    node_text = [f"{node}<br>LOC: {metrics[node]['LOC']}<br>Imports: {metrics[node]['NumImports']}<br>Used by: {metrics[node]['DependsOnMe']}" for node in nodes]
+    edge_shapes = []
+    edge_trace = go.Scatter(
+        x=[],
+        y=[],
+        line=dict(width=0.5, color='gray'),
+        hoverinfo='none',
+        mode='lines'
+    )
 
-    edge_x = []
-    edge_y = []
-    for src, dst in edges:
+    # Draw edges and arrow shapes
+    for src, dst in G.edges():
         x0, y0 = pos[src]
         x1, y1 = pos[dst]
-        edge_x += [x0, x1, None]
-        edge_y += [y0, y1, None]
 
-    return {
-        'data': [
-            go.Scatter(x=edge_x, y=edge_y, mode='lines', line=dict(width=0.5, color='#888'), hoverinfo='none'),
-            go.Scatter(
-                x=node_x, y=node_y, mode='markers',
-                marker=dict(size=node_size, color=node_color, colorscale='Viridis', showscale=True, colorbar=dict(title="Lines of Code")),
-                text=node_text, hoverinfo='text'
+        edge_trace['x'] += [x0, x1, None]
+        edge_trace['y'] += [y0, y1, None]
+
+        # Add arrow as shape
+        edge_shapes.append(
+            dict(
+                type="line",
+                x0=x0,
+                y0=y0,
+                x1=x1,
+                y1=y1,
+                line=dict(color="black", width=1),
+                opacity=1,
+                layer="above",
+                arrowhead=3,
+                arrowsize=1,
             )
-        ],
-        'layout': go.Layout(
-            title='Code Dependency Network',
+        )
+
+    node_trace = go.Scatter(
+        x=[],
+        y=[],
+        text=[],
+        mode='markers',
+        hoverinfo='text',
+        marker=dict(
+            showscale=True,
+            colorscale='Viridis',
+            size=15,
+            color=[],
+            colorbar=dict(
+                thickness=15,
+                title=dict(text='Lines of Code'),
+                xanchor='left'
+            ),
+        )
+    )
+
+    x_vals = []
+    y_vals = []
+    colors = []
+    texts = []
+
+    for node in G.nodes():
+        x, y = pos[node]
+        x_vals.append(x)
+        y_vals.append(y)
+        loc = G.nodes[node].get('loc', 0)  # Retrieve LOC (Lines of Code)
+        colors.append(loc)
+
+        # Get the module name for the node from the module map
+        module_name = module_map.get(node, "Unknown")
+        texts.append(f"{os.path.basename(node)}\nModule: {module_name}")
+
+    node_trace['x'] = x_vals
+    node_trace['y'] = y_vals
+    node_trace['marker']['color'] = colors
+    node_trace['text'] = texts
+
+    fig = go.Figure(
+        data=[edge_trace, node_trace],
+        layout=go.Layout(
+            title=dict(text='Python File Dependency Graph', font=dict(size=20)),
+            showlegend=False,
             hovermode='closest',
             margin=dict(b=20, l=5, r=5, t=40),
             xaxis=dict(showgrid=False, zeroline=False),
-            yaxis=dict(showgrid=False, zeroline=False)
+            yaxis=dict(showgrid=False, zeroline=False),
+            shapes=edge_shapes
         )
-    }
-
-# 4. Dash app
-app = dash.Dash(__name__)
-app.title = "Polymetric View"
-app.layout = html.Div([
-    html.H2("Project Dependency Visualizer"),
-    html.Div([
-        dcc.Input(id='folder-input', type='text', placeholder='Enter path (e.g., /workspaces/api)', style={'width': '60%'}),
-        html.Button('Load', id='load-button', n_clicks=0),
-    ], style={'margin': '10px'}),
-    dcc.Graph(id='graph'),
-    html.H4("Module Metrics"),
-    dash_table.DataTable(
-        id='metrics-table',
-        columns=[
-            {"name": "File", "id": "file"},
-            {"name": "Lines of Code", "id": "loc"},
-            {"name": "Num Imports", "id": "imports"},
-            {"name": "Used By (Dependencies)", "id": "dependents"},
-        ],
-        style_table={'overflowX': 'auto'},
-        style_cell={'textAlign': 'left'},
     )
-])
 
+    return fig
+
+def calculate_cyclomatic_complexity(file_path):
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            source = file.read()
+            try:
+                tree = ast.parse(source, filename=file_path)
+            except (SyntaxError, SyntaxWarning) as e:
+                print(f"Syntax issue in {file_path}: {e}")
+                return 0
+    except Exception as e:
+        print(f"Error reading {file_path}: {e}")
+        return 0
+
+    complexity = 1
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.If, ast.For, ast.While, ast.Try, ast.With, ast.And, ast.Or, ast.ExceptHandler)):
+            complexity += 1
+    return complexity
+
+def create_metrics_table(G, project_root, module_map):
+    data = []
+
+    for node in G.nodes():
+        name = os.path.basename(node)
+        loc = G.nodes[node].get('loc', 0)  # Cohesion = Lines of Code
+        num_imports = G.out_degree(node)  # Outgoing Coupling (dependencies this file imports)
+        used_by = G.in_degree(node)  # Incoming Coupling (how many files depend on this file)
+
+        # Cyclomatic Complexity calculation (Placeholder logic)
+        cyclomatic_complexity = calculate_cyclomatic_complexity(node)
+
+        # Get the module name for the node
+        module_name = module_map.get(node, "Unknown")
+
+        data.append({
+            "File": name,
+            "Module": module_name,
+            "Cohesion (LOC)": loc,
+            "Outgoing Coupling": num_imports,
+            "Incoming Coupling": used_by,
+            "Cyclomatic Complexity": cyclomatic_complexity
+        })
+
+    df = pd.DataFrame(data)
+    df.sort_values(by=['Module', 'Cohesion (LOC)'], ascending=[True, False], inplace=True)
+    return html.Table([ 
+        html.Thead(html.Tr([html.Th(col) for col in df.columns])),
+        html.Tbody([ 
+            html.Tr([html.Td(df.iloc[i][col]) for col in df.columns]) 
+            for i in range(len(df)) 
+        ])
+    ])
+
+# Step 5: Dash app layout
+app = dash.Dash(__name__)
+app.title = "Python Dependency Visualizer"
+
+app.layout = html.Div([html.H1("Python Dependency Visualizer"),
+                       dcc.Input(id='folder-input', type='text', placeholder='Enter project folder path', debounce=True),
+                       html.Button("Generate", id='generate-btn', n_clicks=0),
+                       html.Div(id='feedback'),
+                       dcc.Graph(id='dependency-graph'),
+                       html.H2("Metrics Table"),
+                       html.Div(id='metrics-table')])
+
+# Step 6: Callback logic
 @app.callback(
-    [Output('graph', 'figure'),
-     Output('metrics-table', 'data')],
-    [Input('load-button', 'n_clicks')],
+    [Output('feedback', 'children'),
+     Output('dependency-graph', 'figure'),
+     Output('metrics-table', 'children')],
+    [Input('generate-btn', 'n_clicks')],
     [State('folder-input', 'value')]
 )
-def update_view(n_clicks, folder):
-    if not folder or not os.path.isdir(folder):
-        return go.Figure(), []
+def update_graph(n_clicks, folder_path):
+    if not folder_path:
+        return "Please provide a valid project folder path.", {}, None
 
-    dependencies = gather_dependencies(folder)
-    G, metrics = create_dependency_graph(dependencies)
-    fig = generate_figure(G, metrics)
+    try:
+        # Step 1: Gather dependencies
+        dependencies, module_map = gather_dependencies(folder_path)
 
-    table_data = [{
-        "file": k,
-        "loc": v["LOC"],
-        "imports": v["NumImports"],
-        "dependents": v["DependsOnMe"]
-    } for k, v in metrics.items()]
+        # Step 2: Create graph
+        G = create_dependency_graph(dependencies)
 
-    return fig, table_data
+        # Step 3: Generate figure
+        fig = generate_dependency_figure(G, module_map)
+
+        # Step 4: Create metrics table
+        metrics_table = create_metrics_table(G, folder_path, module_map)
+
+        return "", fig, metrics_table
+
+    except Exception as e:
+        return f"An error occurred: {e}", {}, None
 
 if __name__ == '__main__':
     app.run(debug=True)
