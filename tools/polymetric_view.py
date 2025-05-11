@@ -51,6 +51,7 @@ def create_dependency_graph(dependencies):
     for file, deps in dependencies.items():
         G.add_node(file, loc=count_loc(file))
         for dep in deps:
+            G.add_node(dep)
             G.add_edge(file, dep)
     return G
 
@@ -63,9 +64,6 @@ def count_loc(file_path):
         return 0
 
 def generate_dependency_figure(G, module_map):
-    pos = nx.spring_layout(G, seed=42)
-
-    # Group files by module
     module_files = {}
     for file_path, module in module_map.items():
         module_files.setdefault(module, []).append(file_path)
@@ -73,103 +71,99 @@ def generate_dependency_figure(G, module_map):
     module_positions = {}
     spacing = 5
     for i, module in enumerate(module_files):
-        x = spacing * i
-        y = 0
-        module_positions[module] = (x, y)
+        module_positions[module] = (spacing * i, 0)
 
-    for file in G.nodes():
-        module = module_map.get(file, "Unknown")
-        if module in module_positions:
-            mod_x, mod_y = module_positions[module]
-            dx, dy = np.random.uniform(-1, 1, 2)
-            pos[file] = (mod_x + dx, mod_y + dy)
+    file_positions = {}
+    offset_range = 0.4
+    for module, files in module_files.items():
+        mod_x, mod_y = module_positions[module]
+        for file in files:
+            dx, dy = np.random.uniform(-offset_range, offset_range, 2)
+            file_positions[file] = (mod_x + dx, mod_y + dy)
 
-    for module, (mod_x, mod_y) in module_positions.items():
-        G.add_node(f"__module__{module}", is_module=True, loc=0)
-        pos[f"__module__{module}"] = (mod_x, mod_y)
+    for module, pos in module_positions.items():
+        mod_node = f"__module__{module}"
+        G.add_node(mod_node, is_module=True, loc=0)
+
         for file in module_files[module]:
-            G.add_edge(f"__module__{module}", file)
+            G.add_edge(mod_node, file)
 
-    edge_x, edge_y = [], []
+    pos = {**file_positions, **{f"__module__{m}": p for m, p in module_positions.items()}}
+
+    edge_trace = go.Scatter(x=[], y=[], line=dict(width=0.5, color='gray'),
+                            hoverinfo='none', mode='lines')
     for src, dst in G.edges():
-        x0, y0 = pos[src]
-        x1, y1 = pos[dst]
-        edge_x += [x0, x1, None]
-        edge_y += [y0, y1, None]
+        if src in pos and dst in pos:
+            x0, y0 = pos[src]
+            x1, y1 = pos[dst]
+            edge_trace['x'] += (x0, x1, None)
+            edge_trace['y'] += (y0, y1, None)
 
-    edge_trace = go.Scatter(
-        x=edge_x,
-        y=edge_y,
-        line=dict(width=0.5, color='gray'),
-        hoverinfo='none',
-        mode='lines'
+    node_trace = go.Scatter(
+        x=[], y=[], text=[], mode='markers', hoverinfo='text',
+        marker=dict(showscale=True, colorscale='Viridis', size=15,
+                    color=[], colorbar=dict(thickness=15, title=dict(text='Lines of Code'), xanchor='left'))
     )
 
-    node_x, node_y, node_color, node_text = [], [], [], []
     for node in G.nodes():
         if G.nodes[node].get("is_module"):
             continue
+        if node not in pos:
+            continue
         x, y = pos[node]
         loc = G.nodes[node].get('loc', 0)
-        module_name = module_map.get(node, "Unknown")
-
-        node_x.append(x)
-        node_y.append(y)
-        node_color.append(loc)
-        node_text.append(f"{os.path.basename(node)}\nModule: {module_name}")
-
-    node_trace = go.Scatter(
-        x=node_x,
-        y=node_y,
-        text=node_text,
-        mode='markers',
-        hoverinfo='text',
-        marker=dict(
-            showscale=True,
-            colorscale='Viridis',
-            size=15,
-            color=node_color,
-            colorbar=dict(
-                thickness=15,
-                title=dict(text='Lines of Code'),
-                xanchor='left'
-            )
-        )
-    )
-
-    module_x, module_y, module_text = [], [], []
-    for module, (mod_x, mod_y) in module_positions.items():
-        module_x.append(mod_x)
-        module_y.append(mod_y)
-        module_text.append(module)
+        node_trace['x'] += (x,)
+        node_trace['y'] += (y,)
+        node_trace['marker']['color'] += (loc,)
+        node_trace['text'] += (f"{os.path.basename(node)}\nLOC: {loc}",)  # Show LOC on hover
 
     module_trace = go.Scatter(
-        x=module_x,
-        y=module_y,
-        text=module_text,
-        mode='markers+text',
-        textposition='top center',
-        hoverinfo='text',
-        marker=dict(
-            size=40,
-            color='lightgrey',
-            line=dict(width=2, color='black')
-        )
+        x=[], y=[], text=[], mode='markers+text', textposition='top center', hoverinfo='text',
+        marker=dict(size=60, color='lightgrey', line=dict(width=2, color='black'))
     )
 
-    fig = go.Figure(
-        data=[edge_trace, node_trace, module_trace],
-        layout=go.Layout(
-            title=dict(text='Python File Dependency Graph', font=dict(size=20)),
-            showlegend=False,
-            hovermode='closest',
-            margin=dict(b=20, l=5, r=5, t=40),
-            xaxis=dict(showgrid=False, zeroline=False),
-            yaxis=dict(showgrid=False, zeroline=False)
-        )
-    )
+    for module, (mod_x, mod_y) in module_positions.items():
+        module_trace['x'] += (mod_x,)
+        module_trace['y'] += (mod_y,)
+        module_trace['text'] += (module,)
+
+    fig = go.Figure(data=[edge_trace, node_trace, module_trace],
+                    layout=go.Layout(
+                        title=dict(text='Python File Dependency Graph', font=dict(size=20)),
+                        showlegend=False, hovermode='closest', margin=dict(b=20, l=5, r=5, t=40),
+                        xaxis=dict(showgrid=False, zeroline=False), yaxis=dict(showgrid=False, zeroline=False),
+                        paper_bgcolor='#edf1f5'
+                    ))
 
     return fig
+
+def create_metrics_table(G, project_root, module_map):
+    data = []
+    for node in G.nodes():
+        if G.nodes[node].get("is_module"):
+            continue
+        name = os.path.basename(node)
+        loc = G.nodes[node].get('loc', 0)
+        num_imports = G.out_degree(node)  # Outgoing Coupling
+        used_by = G.in_degree(node)  # Incoming Coupling
+        coupling = num_imports + used_by  # Combined Coupling (incoming + outgoing)
+        cyclomatic_complexity = calculate_cyclomatic_complexity(node)
+        module_name = module_map.get(node, "Unknown")
+        data.append({
+            "File": name,
+            "Module": module_name,
+            "LOC": loc,  
+            "Coupling": coupling,  
+            "Cyclomatic Complexity": cyclomatic_complexity
+        })
+
+    df = pd.DataFrame(data)
+    df.sort_values(by=['Module', 'Cohesion'], ascending=[True, False], inplace=True)
+
+    return html.Table([  
+        html.Thead(html.Tr([html.Th(col, style={'padding': '10px'}) for col in df.columns])),
+        html.Tbody([html.Tr([html.Td(df.iloc[i][col], style={'padding': '10px'}) for col in df.columns]) for i in range(len(df))])
+    ])
 
 def calculate_cyclomatic_complexity(file_path):
     try:
@@ -184,35 +178,6 @@ def calculate_cyclomatic_complexity(file_path):
         if isinstance(node, (ast.If, ast.For, ast.While, ast.Try, ast.With, ast.And, ast.Or, ast.ExceptHandler)):
             complexity += 1
     return complexity
-
-def create_metrics_table(G, project_root, module_map):
-    data = []
-    for node in G.nodes():
-        if G.nodes[node].get("is_module"):
-            continue
-        name = os.path.basename(node)
-        loc = G.nodes[node].get('loc', 0)
-        num_imports = G.out_degree(node)
-        used_by = G.in_degree(node)
-        cyclomatic_complexity = calculate_cyclomatic_complexity(node)
-        module_name = module_map.get(node, "Unknown")
-        data.append({
-            "File": name,
-            "Module": module_name,
-            "Cohesion (LOC)": loc,
-            "Outgoing Coupling": num_imports,
-            "Incoming Coupling": used_by,
-            "Cyclomatic Complexity": cyclomatic_complexity
-        })
-
-    df = pd.DataFrame(data)
-    df.sort_values(by=['Module', 'Cohesion (LOC)'], ascending=[True, False], inplace=True)
-    return html.Table([
-        html.Thead(html.Tr([html.Th(col) for col in df.columns])),
-        html.Tbody([
-            html.Tr([html.Td(df.iloc[i][col]) for col in df.columns]) for i in range(len(df))
-        ])
-    ])
 
 app = dash.Dash(__name__)
 app.title = "Python Dependency Visualizer"
@@ -234,6 +199,7 @@ app.layout = html.Div([
     [Input('generate-btn', 'n_clicks')],
     [State('folder-input', 'value')]
 )
+
 def update_graph(n_clicks, folder_path):
     if not folder_path:
         return "Please provide a valid project folder path.", {}, None
