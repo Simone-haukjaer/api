@@ -158,7 +158,7 @@ def create_metrics_table(G, project_root, module_map):
         })
 
     df = pd.DataFrame(data)
-    df.sort_values(by=['Module', 'Cohesion'], ascending=[True, False], inplace=True)
+    df.sort_values(by=['Module', 'LOC'], ascending=[True, False], inplace=True)
 
     return html.Table([  
         html.Thead(html.Tr([html.Th(col, style={'padding': '10px'}) for col in df.columns])),
